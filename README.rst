@@ -126,4 +126,14 @@ Building
    You should find ``parquetjni-0.0.1.jar`` in ``target/`` under the
    ParquetJNI repository root.
 
+Development
+===========
+
+This is a Maven project and should be importable into IntelliJ.
+
+For example, see "Project Structure > Libraries" window where a Maven
+IntelliJ project is depending on the local ParquetJNI project:
+
+.. image:: .readme/intellij.png
+
 .. _Arrow website: https://arrow.apache.org/docs/developers/cpp/building.html
