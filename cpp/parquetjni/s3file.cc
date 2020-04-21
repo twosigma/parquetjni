@@ -180,8 +180,8 @@ class ObjectInputFile : public arrow::io::RandomAccessFile {
     // No need to allocate more than the remaining number of bytes
     nbytes = std::min(nbytes, content_length_ - position);
 
-    std::shared_ptr<ResizableBuffer> buf;
-    RETURN_NOT_OK(AllocateResizableBuffer(GetTrackedPool(), nbytes, &buf));
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<ResizableBuffer> buf,
+                          AllocateResizableBuffer(nbytes, GetTrackedPool()));
     if (nbytes > 0) {
       ARROW_ASSIGN_OR_RAISE(int64_t bytes_read,
                             ReadAt(position, nbytes, buf->mutable_data()));

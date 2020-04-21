@@ -185,8 +185,13 @@ Java_com_twosigma_parquetjni_ParquetJni_readReaderSchema(JNIEnv *env,
 
   const auto profile_start = std::chrono::steady_clock::now();
   std::shared_ptr<arrow::Schema> schema = handle->reader->schema();
-  std::shared_ptr<arrow::Buffer> buf;
-  arrow::ipc::SerializeSchema(*schema, nullptr, GetTrackedPool(), &buf);
+  arrow::Result<std::shared_ptr<arrow::Buffer>> result =
+      arrow::ipc::SerializeSchema(*schema, nullptr, GetTrackedPool());
+  if (!result.ok()) {
+    ThrowIoException(env, result.status().ToString());
+    return nullptr;
+  }
+  std::shared_ptr<arrow::Buffer> buf = result.ValueOrDie();
 
   jbyteArray serialized =
       static_cast<jbyteArray>(env->NewByteArray(buf->size()));
@@ -235,10 +240,15 @@ Java_com_twosigma_parquetjni_ParquetJni_nextRecordBatch(JNIEnv *env,
   }
 
   const auto profile_start = std::chrono::steady_clock::now();
-  std::shared_ptr<arrow::Buffer> buf;
   auto options = arrow::ipc::IpcWriteOptions::Defaults();
   options.memory_pool = GetTrackedPool();
-  arrow::ipc::SerializeRecordBatch(*batch, options, &buf);
+  arrow::Result<std::shared_ptr<arrow::Buffer>> result =
+      arrow::ipc::SerializeRecordBatch(*batch, options);
+  if (!result.ok()) {
+    ThrowIoException(env, result.status().ToString());
+    return nullptr;
+  }
+  std::shared_ptr<arrow::Buffer> buf = result.ValueOrDie();
   TRACE("RecordBatchReader::SerializeRecordBatch", profile_start,
         serialize_end);
 
