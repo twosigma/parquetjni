@@ -25,6 +25,9 @@ find_package(PkgConfig REQUIRED)
 include(UseJava)
 
 find_package(Arrow CONFIG REQUIRED)
+
+# Work around FindJNI not finding this in some cases
+set(JAVA_AWT_INCLUDE_PATH NotNeeded)
 find_package(JNI REQUIRED)
 find_package(Parquet REQUIRED)
 
