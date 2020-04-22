@@ -211,8 +211,8 @@ class DatasetBatchReader : public arrow::RecordBatchReader {
         min_utc_ns_(min_utc_ns),
         max_utc_ns_(max_utc_ns),
         filter_row_groups_(filter_row_groups),
-        file_queue_(std::deque<std::string>(dataset->keys_.begin(),
-                                            dataset->keys_.end())) {}
+        file_queue_(std::deque<std::string>(dataset_->keys_.begin(),
+                                            dataset_->keys_.end())) {}
 
   ~DatasetBatchReader() = default;
 
