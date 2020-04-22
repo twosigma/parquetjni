@@ -86,9 +86,9 @@ arrow::Status SingleFileParquetJniReader::Open(
   // Enable parallel reads.
   parquet::ArrowReaderProperties properties;
   properties.set_use_threads(true);
+  properties.set_pre_buffer(true);
   parquet::ReaderProperties parquet_properties =
       parquet::ReaderProperties(GetTrackedPool());
-  parquet_properties.enable_coalesced_stream();
   std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
   // TODO(lidavidm): measure overhead of this call; likely makes a
   // request to TS3
