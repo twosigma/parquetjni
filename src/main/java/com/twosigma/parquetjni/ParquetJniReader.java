@@ -17,8 +17,12 @@
 package com.twosigma.parquetjni;
 
 import io.netty.buffer.ArrowBuf;
+
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Collections;
@@ -26,7 +30,9 @@ import java.util.Iterator;
 import org.apache.arrow.flatbuf.Message;
 import org.apache.arrow.flatbuf.MessageHeader;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.ipc.ReadChannel;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.ipc.message.MessageMetadataResult;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -49,18 +55,11 @@ public class ParquetJniReader implements AutoCloseable {
     static Schema parseSerializedSchema(byte[] serializedSchema) throws IOException {
         final long start = System.nanoTime();
 
-        int messageLength = MessageSerializer.bytesToInt(serializedSchema);
-        if (messageLength + 4 != serializedSchema.length) {
-            throw new IOException(
-                    "Expected message of length "
-                            + messageLength
-                            + " but got one of length "
-                            + (serializedSchema.length - 4));
-        }
-        ByteBuffer bb = ByteBuffer.allocate(messageLength);
-        bb.put(serializedSchema, 4, messageLength);
-        bb.rewind();
-        final Schema result = MessageSerializer.deserializeSchema(Message.getRootAsMessage(bb));
+        final ByteArrayInputStream is = new ByteArrayInputStream(serializedSchema);
+        final ReadableByteChannel ch = Channels.newChannel(is);
+        final MessageMetadataResult metadata = MessageSerializer.readMessage(new ReadChannel(ch));
+        final Message message = metadata.getMessage();
+        final Schema result = MessageSerializer.deserializeSchema(message);
         final double duration = Duration.ofNanos(System.nanoTime() - start).toMillis() / 1000.0;
         System.err.println("TRACE: ParquetJniReader::ParseSchema " + duration);
         return result;
@@ -182,35 +181,29 @@ public class ParquetJniReader implements AutoCloseable {
             }
 
             final long start = System.nanoTime();
-            int messageLength = MessageSerializer.bytesToInt(serializedBatch);
-            if (messageLength + 4 > serializedBatch.length) {
-                throw new IOException(
-                        "Expected message of length at least "
-                                + messageLength
-                                + " but got one of length "
-                                + (serializedBatch.length - 4));
+            final ByteArrayInputStream is = new ByteArrayInputStream(serializedBatch);
+            final ReadableByteChannel ch = Channels.newChannel(is);
+            final MessageMetadataResult result = MessageSerializer.readMessage(new ReadChannel(ch));
+            if (result == null) {
+                throw new IOException("Invalid or incomplete record batch");
             }
-            ByteBuffer bb = ByteBuffer.allocate(messageLength);
-            bb.put(serializedBatch, 4, messageLength);
-            bb.rewind();
-            final Message message = Message.getRootAsMessage(bb);
+            final Message message = result.getMessage();
             if (message.headerType() != MessageHeader.RecordBatch) {
                 throw new IOException("Expected record batch, got " + message.headerType());
             }
-            final int remainingLength = serializedBatch.length - (messageLength + 4);
-            if (message.bodyLength() > remainingLength) {
+            if (message.bodyLength() > is.available()) {
                 throw new IOException(
                         "Expected message of length at least "
                                 + message.bodyLength()
                                 + " but got one of length "
-                                + remainingLength);
+                                + is.available());
             }
             if (message.bodyLength() > Integer.MAX_VALUE) {
                 throw new IOException("Cannot deserialize record batch larger than 2GB");
             }
 
-            ArrowBuf buf = allocator.buffer((int) message.bodyLength());
-            buf.writeBytes(serializedBatch, messageLength + 4, (int) message.bodyLength());
+            final ArrowBuf buf = allocator.buffer((int) message.bodyLength());
+            ch.read(buf.nioBuffer());
             this.nextBatch = MessageSerializer.deserializeRecordBatch(message, buf);
 
             if (TRACE) {
