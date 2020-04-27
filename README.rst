@@ -82,6 +82,7 @@ Building
           -DARROW_FLIGHT=OFF \
           -DARROW_PYTHON=OFF \
           -DARROW_S3=OFF \
+          -DARROW_WITH_SNAPPY=ON \
           -DARROW_BUILD_BENCHMARKS=OFF \
           -DARROW_BUILD_INTEGRATION=OFF \
           -DARROW_BUILD_TESTS=OFF
