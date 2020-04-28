@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <iomanip>
+#include <thread>
 
 // Abort if the status is an error.
 #define PARQUETJNI_CHECK_OK(s)            \
@@ -34,13 +35,25 @@
   } while (false)
 
 // Log a timing trace.
-#define TRACE(LABEL, START, END)                                     \
-  const auto END = std::chrono::steady_clock::now();                 \
-  {                                                                  \
-    const auto __start = (START);                                    \
-    std::chrono::duration<double> __diff = END - __start;            \
-    VLOG(2) << "TRACE: " << (LABEL) << ' ' << std::fixed             \
-            << std::setprecision(15) << __diff.count() << std::endl; \
+#define TRACE(LABEL, START, END)                                         \
+  const auto END = std::chrono::steady_clock::now();                     \
+  {                                                                      \
+    const auto __start = (START);                                        \
+    VLOG(2) << "TRACE: " << (LABEL) << ' ' << std::this_thread::get_id() \
+            << ' ' << std::fixed << std::setprecision(5)                 \
+            << __start.time_since_epoch().count() << ' '                 \
+            << END.time_since_epoch().count() << std::endl;              \
+  }
+
+#define TRACE_WITH(LABEL, SPAN, START, END)                               \
+  const auto END = std::chrono::steady_clock::now();                      \
+  {                                                                       \
+    const auto __start = (START);                                         \
+    std::chrono::duration<double> __diff = END - __start;                 \
+    VLOG(2) << "TRACE: " << (LABEL) << " label=" << (SPAN) << ' '         \
+            << std::this_thread::get_id() << ' ' << std::fixed            \
+            << std::setprecision(5) << __start.time_since_epoch().count() \
+            << ' ' << END.time_since_epoch().count() << std::endl;        \
   }
 
 #endif  // PARQUETJNI_UTIL_H_

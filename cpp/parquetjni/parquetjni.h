@@ -78,7 +78,7 @@ class SingleFileParquetJniReader : public ParquetJniReader {
                             const std::string &auth_token,
                             ParquetJniReader **out);
   static arrow::Status Open(
-      std::shared_ptr<arrow::io::RandomAccessFile> arrow_file,
+      std::string name, std::shared_ptr<arrow::io::RandomAccessFile> arrow_file,
       ParquetJniReader **out);
 
   /// \brief Get the schema of the file.
@@ -107,9 +107,11 @@ class SingleFileParquetJniReader : public ParquetJniReader {
 
  private:
   explicit SingleFileParquetJniReader(
+      std::string name,
       std::unique_ptr<parquet::arrow::FileReader> arrow_reader)
-      : arrow_reader_(std::move(arrow_reader)) {}
+      : name_(std::move(name)), arrow_reader_(std::move(arrow_reader)) {}
 
+  std::string name_;
   std::unique_ptr<parquet::arrow::FileReader> arrow_reader_;
 };
 

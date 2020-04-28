@@ -34,12 +34,23 @@ find_package(Parquet REQUIRED)
 get_target_property(ARROW_INCLUDE_DIRS arrow_shared INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(PARQUET_INCLUDE_DIRS parquet_shared INTERFACE_INCLUDE_DIRECTORIES)
 
+pkg_check_modules(GTest gtest)
+pkg_check_modules(GTestMain gtest_main)
+
 message(STATUS "Dependencies configured via CMake:")
 message(STATUS "Arrow version: ${Arrow_VERSION}")
 message(STATUS "Arrow includes: ${ARROW_INCLUDE_DIRS}")
 message(STATUS "Parquet version: ${Parquet_VERSION}")
 message(STATUS "Parquet includes: ${PARQUET_INCLUDE_DIRS}")
 message(STATUS "JNI headers: ${JNI_INCLUDE_DIRS}")
+
+message(STATUS "Dependencies configured via pkg-config:")
+if (GTest_FOUND AND GTestMain_FOUND)
+message(STATUS "GTest libraries: ${GTest_LIBRARIES} ${GTestMain_LIBRARIES}")
+message(STATUS "GTest includes: ${GTest_INCLUDE_DIRS} ${GTestMain_INCLUDE_DIRS}")
+else()
+message(STATUS "GTest not found")
+endif()
 
 message(STATUS "Dependencies configured via manually-set variables:")
 message(STATUS "(set these via cmake -D...=...)")
@@ -62,6 +73,22 @@ add_jar(
   DESTINATION ${GENERATED_HEADERS_DIR}
   )
 
+set(PARQUETJNI_INCLUDE_DIRS
+  cpp/
+  ${GENERATED_HEADERS_DIR}
+  ${ARROW_INCLUDE_DIRS}
+  ${AWSSDK_INCLUDE_DIRS}
+  ${GLOG_INCLUDE_DIRS}
+  ${JNI_INCLUDE_DIRS}
+  ${PARQUET_INCLUDE_DIRS}
+  )
+
+set(PARQUETJNI_LIBRARIES
+  arrow_shared parquet_shared glog aws-cpp-sdk-s3
+  )
+
+add_compile_options(-fno-omit-frame-pointer)
+
 add_library(
   parquetjni_lib
   SHARED
@@ -72,20 +99,38 @@ add_library(
   )
 add_dependencies(parquetjni_lib parquetjni_headers)
 set_property(TARGET parquetjni_lib PROPERTY CXX_STANDARD 11)
-
 target_include_directories(
   parquetjni_lib
   PRIVATE
-  cpp/
-  ${GENERATED_HEADERS_DIR}
-  ${ARROW_INCLUDE_DIRS}
-  ${AWSSDK_INCLUDE_DIRS}
-  ${GLOG_INCLUDE_DIRS}
-  ${JNI_INCLUDE_DIRS}
-  ${PARQUET_INCLUDE_DIRS}
+  ${PARQUETJNI_INCLUDE_DIRS}
   )
+target_link_libraries(parquetjni_lib PUBLIC ${PARQUETJNI_LIBRARIES})
 
-target_link_libraries(parquetjni_lib PUBLIC arrow_shared parquet_shared glog aws-cpp-sdk-s3)
+if (GTest_FOUND AND GTestMain_FOUND)
+  # Set up unit tests
+  add_executable(
+    parquetjni-test
+    cpp/parquetjni/parquetjni_test.cc
+    )
+  set_property(TARGET parquetjni-test PROPERTY CXX_STANDARD 11)
+  target_include_directories(
+    parquetjni-test
+    PRIVATE
+    ${PARQUETJNI_INCLUDE_DIRS}
+    ${GTest_INCLUDE_DIRS}
+    ${GTestMain_INCLUDE_DIRS}
+    )
+  target_link_libraries(
+    parquetjni-test
+    PUBLIC
+    ${PARQUETJNI_LIBRARIES}
+    snappy
+    thrift
+    parquetjni_lib
+    ${GTest_LIBRARIES}
+    ${GTestMain_LIBRARIES}
+    )
+endif()
 
 install(
   TARGETS parquetjni_lib

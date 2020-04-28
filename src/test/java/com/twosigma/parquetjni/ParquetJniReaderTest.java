@@ -18,6 +18,9 @@ package com.twosigma.parquetjni;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -40,12 +43,18 @@ class ParquetJniReaderTest {
                     ParquetJniReader.open(allocator, "http://localhost:9000", TOKEN, BUCKET, KEYS)) {
                 final ReadOptions readOptions = ReadOptions.newBuilder().build();
                 try (final ParquetJniReader.ArrowRecordBatchReader reader = file.readAll(readOptions)) {
-                    Assertions.assertTrue(reader.hasNext());
+                    final Schema schema = reader.getSchema();
+                    Assertions.assertEquals(100, schema.getFields().size());
+                    for (final Field field : schema.getFields()) {
+                        Assertions.assertTrue(field.getType() instanceof ArrowType.FloatingPoint);
+                    }
+                    long totalRows = 0;
                     while (reader.hasNext()) {
                         try (final ArrowRecordBatch batch = reader.next()) {
-                            ;
+                            totalRows += batch.getLength();
                         }
                     }
+                    Assertions.assertEquals(524288, totalRows);
                 }
             }
         }

@@ -39,6 +39,7 @@
 #include <utility>
 
 #include "parquetjni/memory_tracking.h"
+#include "parquetjni/util.h"
 
 namespace S3Model = Aws::S3::Model;
 
@@ -64,6 +65,7 @@ std::string FormatRange(int64_t start, int64_t length) {
 arrow::Status GetObjectRange(Aws::S3::S3Client *client, const S3Path &path,
                              int64_t start, int64_t length,
                              S3Model::GetObjectResult *out) {
+  const auto profile_start = std::chrono::steady_clock::now();
   S3Model::GetObjectRequest req;
   req.SetBucket(ToAwsString(path.bucket));
   req.SetKey(ToAwsString(path.key));
@@ -73,6 +75,7 @@ arrow::Status GetObjectRange(Aws::S3::S3Client *client, const S3Path &path,
     return arrow::Status::IOError(result.GetError());
   }
   *out = result.GetResultWithOwnership();
+  TRACE_WITH("S3File::GetObjectRange", path.key, profile_start, load_end);
   return arrow::Status::OK();
 }
 

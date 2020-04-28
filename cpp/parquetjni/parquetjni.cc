@@ -26,7 +26,9 @@
 #include <parquet/statistics.h>
 
 #include <deque>
+#include <future>
 #include <queue>
+#include <thread>
 #include <vector>
 
 #include "parquetjni/memory_tracking.h"
@@ -65,7 +67,7 @@ arrow::Status SingleFileParquetJniReader::Open(const std::string &file_path,
   ARROW_ASSIGN_OR_RAISE(
       auto arrow_file,
       arrow::io::MemoryMappedFile::Open(file_path, arrow::io::FileMode::READ));
-  return Open(arrow_file, out);
+  return Open(file_path, arrow_file, out);
 }
 
 arrow::Status SingleFileParquetJniReader::Open(const std::string &endpoint,
@@ -76,17 +78,18 @@ arrow::Status SingleFileParquetJniReader::Open(const std::string &endpoint,
   S3Path path{bucket, key};
   std::shared_ptr<arrow::io::RandomAccessFile> arrow_file;
   ARROW_RETURN_NOT_OK(OpenS3File(path, endpoint, auth_token, &arrow_file));
-  return Open(arrow_file, out);
+  return Open(key, arrow_file, out);
 }
 
 arrow::Status SingleFileParquetJniReader::Open(
-    std::shared_ptr<arrow::io::RandomAccessFile> arrow_file,
+    std::string name, std::shared_ptr<arrow::io::RandomAccessFile> arrow_file,
     ParquetJniReader **out) {
   const auto profile_start = std::chrono::steady_clock::now();
   // Enable parallel reads.
   parquet::ArrowReaderProperties properties;
   properties.set_use_threads(true);
   properties.set_pre_buffer(true);
+
   parquet::ReaderProperties parquet_properties =
       parquet::ReaderProperties(GetTrackedPool());
   std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
@@ -97,7 +100,8 @@ arrow::Status SingleFileParquetJniReader::Open(
   ARROW_RETURN_NOT_OK(builder.properties(properties)
                           ->memory_pool(GetTrackedPool())
                           ->Build(&arrow_reader));
-  *out = new SingleFileParquetJniReader(std::move(arrow_reader));
+  *out =
+      new SingleFileParquetJniReader(std::move(name), std::move(arrow_reader));
   TRACE("ParquetJniReader::Open", profile_start, open_end);
   return arrow::Status::OK();
 }
@@ -119,7 +123,8 @@ arrow::Status SingleFileParquetJniReader::GetRecordBatchReader(
   std::vector<int> column_indices;
   const auto profile_start = std::chrono::steady_clock::now();
   std::shared_ptr<parquet::FileMetaData> metadata = parquet_reader->metadata();
-  TRACE("ParquetJniReader::ReadMetadata", profile_start, metadata_end);
+  TRACE_WITH("ParquetJniReader::ReadMetadata", name_, profile_start,
+             metadata_end);
   for (int i = 0; i < arrow_reader_->num_row_groups(); i++) {
     bool include_row_group = true;
     if (time_column != "" || has_column_filter) {
@@ -162,7 +167,8 @@ arrow::Status SingleFileParquetJniReader::GetRecordBatchReader(
       row_group_indices.push_back(i);
     }
   }
-  TRACE("ParquetJniReader::FilterRowsColumns", metadata_end, filter_end);
+  TRACE_WITH("ParquetJniReader::FilterRowsColumns", name_, metadata_end,
+             filter_end);
 
   if (row_group_indices.size() == 0) {
     // No data to read
@@ -187,15 +193,51 @@ arrow::Status SingleFileParquetJniReader::GetRecordBatchReader(
     ARROW_RETURN_NOT_OK(arrow_reader_->ReadTable(&table));
     *out = std::make_shared<OwningTableBatchReader>(table);
   }
-  TRACE("ParquetJniReader::OpenRecordBatchReader", filter_end, open_end);
+  TRACE_WITH("ParquetJniReader::OpenRecordBatchReader", name_, filter_end,
+             open_end);
   return arrow::Status::OK();
 }
 
 arrow::Status SingleFileParquetJniReader::Close() {
-  // TODO(lidavidm): figure out how to close parquet::arrow::FileReader
-  // arrow_reader_->Close();
   return arrow::Status::OK();
 }
+
+/// The maximum number of Parquet files to hold in memory at once.
+constexpr int8_t kMaxFilesBuffered = 3;
+
+/// State for a single Parquet file being buffered.
+class BufferedFile {
+ public:
+  explicit BufferedFile(std::string name, arrow::Status status,
+                        std::unique_ptr<ParquetJniReader> file,
+                        std::shared_ptr<arrow::RecordBatchReader> reader)
+      : name_(std::move(name)),
+        status_(status),
+        file_(std::move(file)),
+        reader_(std::move(reader)) {}
+
+  const std::string &name() const { return name_; }
+
+  arrow::Status Close() {
+    RETURN_NOT_OK(status_);
+    reader_.reset();
+    return file_->Close();
+  }
+
+  arrow::Status GetReader(
+      std::shared_ptr<arrow::RecordBatchReader> *reader) const {
+    RETURN_NOT_OK(status_);
+    *reader = reader_;
+    return arrow::Status::OK();
+  }
+
+ private:
+  std::string name_;
+  arrow::Status status_;
+  // These pointers are only valid if status is Status::OK.
+  std::unique_ptr<ParquetJniReader> file_;
+  std::shared_ptr<arrow::RecordBatchReader> reader_;
+};
 
 class DatasetBatchReader : public arrow::RecordBatchReader {
  public:
@@ -211,6 +253,8 @@ class DatasetBatchReader : public arrow::RecordBatchReader {
         min_utc_ns_(min_utc_ns),
         max_utc_ns_(max_utc_ns),
         filter_row_groups_(filter_row_groups),
+        schema_(nullptr),
+        file_readers_(),
         file_queue_(std::deque<std::string>(dataset_->keys_.begin(),
                                             dataset_->keys_.end())) {}
 
@@ -221,6 +265,7 @@ class DatasetBatchReader : public arrow::RecordBatchReader {
                             const std::string &time_column, int64_t min_utc_ns,
                             int64_t max_utc_ns, bool filter_row_groups,
                             std::shared_ptr<arrow::RecordBatchReader> *out) {
+    const auto profile_start = std::chrono::steady_clock::now();
     *out = std::make_shared<DatasetBatchReader>(std::move(dataset), columns,
                                                 time_column, min_utc_ns,
                                                 max_utc_ns, filter_row_groups);
@@ -229,46 +274,94 @@ class DatasetBatchReader : public arrow::RecordBatchReader {
     // Access private fields
     DatasetBatchReader *reader = static_cast<DatasetBatchReader *>(out->get());
     // Load the first file and get the schema.
-    ARROW_RETURN_NOT_OK(reader->LoadNext());
-    reader->schema_ = reader->current_reader_->schema();
+    ARROW_RETURN_NOT_OK(reader->EnqueueReads(kMaxFilesBuffered));
+    if (reader->file_readers_.empty()) {
+      return arrow::Status::Invalid("No files in dataset");
+    }
+    TRACE("ParquetJniDataset::Open::LoadNext", profile_start, load_end);
+    std::shared_ptr<arrow::RecordBatchReader> batch_reader;
+    RETURN_NOT_OK(reader->file_readers_.front().get().GetReader(&batch_reader));
+    reader->schema_ = batch_reader->schema();
+    TRACE("ParquetJniDataset::Open::Schema", load_end, open_end);
     return arrow::Status::OK();
   }
 
   arrow::Status LoadNext() {
-    current_reader_ = nullptr;
-    if (current_jni_reader_) {
-      RETURN_NOT_OK(current_jni_reader_->Close());
+    if (!file_readers_.empty()) {
+      BufferedFile &buffered_file =
+          const_cast<BufferedFile &>(file_readers_.front().get());
+      RETURN_NOT_OK(buffered_file.Close());
+      file_readers_.pop();
     }
-    current_jni_reader_ = nullptr;
-    if (file_queue_.empty()) {
-      return arrow::Status::OK();
+    return EnqueueReads(kMaxFilesBuffered);
+  }
+
+  arrow::Status EnqueueReads(size_t max_files) {
+    const auto profile_start = std::chrono::steady_clock::now();
+    while (file_readers_.size() < max_files && !file_queue_.empty()) {
+      const std::string next_file = file_queue_.front();
+      file_queue_.pop();
+      std::packaged_task<BufferedFile()> task(
+          [next_file, this, profile_start]() {
+            ParquetJniReader *jni_reader;
+            arrow::Status status = SingleFileParquetJniReader::Open(
+                dataset_->endpoint_, dataset_->bucket_, next_file,
+                dataset_->auth_token_, &jni_reader);
+            if (!status.ok()) {
+              return BufferedFile(next_file, status, nullptr, nullptr);
+            }
+            std::shared_ptr<arrow::RecordBatchReader> batch_reader;
+            status = jni_reader->GetRecordBatchReader(
+                columns_, time_column_, min_utc_ns_, max_utc_ns_,
+                filter_row_groups_, &batch_reader);
+            if (!status.ok()) {
+              return BufferedFile(next_file, status, nullptr, nullptr);
+            }
+            TRACE_WITH("ParquetJniDataset::EnqueueReads", next_file,
+                       profile_start, load_end);
+            return BufferedFile(next_file, arrow::Status::OK(),
+                                std::unique_ptr<ParquetJniReader>(jni_reader),
+                                std::move(batch_reader));
+          });
+      std::future<BufferedFile> future = task.get_future();
+      std::thread thread(std::move(task));
+      thread.detach();
+      file_readers_.emplace(std::move(future));
     }
-    const std::string next_file = file_queue_.front();
-    file_queue_.pop();
-    ParquetJniReader *jni_reader;
-    RETURN_NOT_OK(SingleFileParquetJniReader::Open(
-        dataset_->endpoint_, dataset_->bucket_, next_file,
-        dataset_->auth_token_, &jni_reader));
-    current_jni_reader_.reset(jni_reader);
-    const auto result = current_jni_reader_->GetRecordBatchReader(
-        columns_, time_column_, min_utc_ns_, max_utc_ns_, filter_row_groups_,
-        &current_reader_);
-    return result;
+    TRACE("ParquetJniDataset::EnqueueReads", profile_start, load_end);
+    return arrow::Status::OK();
   }
 
   std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
 
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
-    if (!current_reader_) {
+    const auto profile_start = std::chrono::steady_clock::now();
+    ARROW_RETURN_NOT_OK(EnqueueReads(kMaxFilesBuffered));
+    TRACE("ParquetJniDataset::ReadNext::EnqueueReads", profile_start,
+          enqueue_end);
+    if (file_readers_.empty()) {
       *batch = nullptr;
       return arrow::Status::OK();
     }
-    ARROW_RETURN_NOT_OK(current_reader_->ReadNext(batch));
+    std::shared_ptr<arrow::RecordBatchReader> batch_reader;
+    const BufferedFile &file = file_readers_.front().get();
+    TRACE_WITH("ParquetJniDataset::ReadNext::GetFront", file.name(),
+               enqueue_end, get_end);
+    ARROW_RETURN_NOT_OK(file.GetReader(&batch_reader));
+    TRACE_WITH("ParquetJniDataset::ReadNext::GetReader", file.name(), get_end,
+               reader_end);
+    ARROW_RETURN_NOT_OK(batch_reader->ReadNext(batch));
+    TRACE_WITH("ParquetJniDataset::ReadNext::ReadNext", file.name(), reader_end,
+               reading_end);
     if (batch == nullptr || *batch == nullptr) {
       // This file was drained, load a new file
       ARROW_RETURN_NOT_OK(LoadNext());
+      TRACE_WITH("ParquetJniDataset::ReadNext (EOF)", file.name(), reading_end,
+                 read_end);
       return ReadNext(batch);
     }
+    TRACE_WITH("ParquetJniDataset::ReadNext", file.name(), reading_end,
+               read_end);
     return arrow::Status::OK();
   }
 
@@ -281,8 +374,9 @@ class DatasetBatchReader : public arrow::RecordBatchReader {
   bool filter_row_groups_;
 
   std::shared_ptr<arrow::Schema> schema_;
-  std::unique_ptr<ParquetJniReader> current_jni_reader_;
-  std::shared_ptr<arrow::RecordBatchReader> current_reader_;
+  // Queue of files buffered for reading. The head of the queue is the
+  // file currently being read.
+  std::queue<std::shared_future<BufferedFile>> file_readers_;
   std::queue<std::string> file_queue_;
 };
 
