@@ -355,8 +355,10 @@ class DatasetBatchReader : public arrow::RecordBatchReader {
                reading_end);
     if (batch == nullptr || *batch == nullptr) {
       // This file was drained, load a new file
+      // Copy name for tracing to avoid use-after-free
+      const std::string old_name = file.name();
       ARROW_RETURN_NOT_OK(LoadNext());
-      TRACE_WITH("ParquetJniDataset::ReadNext (EOF)", file.name(), reading_end,
+      TRACE_WITH("ParquetJniDataset::ReadNext (EOF)", old_name, reading_end,
                  read_end);
       return ReadNext(batch);
     }
