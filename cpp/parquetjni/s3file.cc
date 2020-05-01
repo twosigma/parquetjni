@@ -49,6 +49,8 @@ template <typename T>
 using Result = arrow::Result<T>;
 using Status = arrow::Status;
 
+constexpr char kAuthHeader[] = "Authorization";
+
 inline Aws::String ToAwsString(const std::string &s) {
   // Direct construction of Aws::String from std::string doesn't work because
   // it uses a specific Allocator class.
@@ -62,17 +64,45 @@ std::string FormatRange(int64_t start, int64_t length) {
   return ss.str();
 }
 
-arrow::Status GetObjectRange(Aws::S3::S3Client *client, const S3Path &path,
-                             int64_t start, int64_t length,
+/// Inject a custom authorization header into an S3 request.
+///
+/// The AWS C++ SDK doesn't make it easy to attach arbitrary headers
+/// to a request within a narrow scope. Overriding the global client's
+/// HTTP client factory lets you do this on a global basis
+/// only. Modifying the headers on a request object will not work as
+/// the value does not persist. Instead, this template generates a
+/// subclass of an S3 request that will inject the headers.
+template <typename T>
+class WithAuth : public T {
+ public:
+  explicit WithAuth(Aws::String auth_token)
+      : T(), auth_token_(std::move(auth_token)) {}
+
+  Aws::Http::HeaderValueCollection GetRequestSpecificHeaders() const override {
+    Aws::Http::HeaderValueCollection headers = T::GetRequestSpecificHeaders();
+    headers.emplace(Aws::Http::HeaderValuePair(kAuthHeader, auth_token_));
+    return headers;
+  }
+
+ private:
+  Aws::String auth_token_;
+};
+
+arrow::Status GetObjectRange(Aws::S3::S3Client *client,
+                             const Aws::String &access_token,
+                             const S3Path &path, int64_t start, int64_t length,
                              S3Model::GetObjectResult *out) {
   const auto profile_start = std::chrono::steady_clock::now();
-  S3Model::GetObjectRequest req;
+  WithAuth<S3Model::GetObjectRequest> req(access_token);
+  req.GetHeaders().emplace(
+      Aws::Http::HeaderValuePair(kAuthHeader, access_token));
   req.SetBucket(ToAwsString(path.bucket));
   req.SetKey(ToAwsString(path.key));
   req.SetRange(ToAwsString(FormatRange(start, length)));
   auto result = client->GetObject(req);
   if (!result.IsSuccess()) {
-    return arrow::Status::IOError(result.GetError());
+    return arrow::Status::IOError("Could not read file", path.bucket, path.key,
+                                  result.GetError());
   }
   *out = result.GetResultWithOwnership();
   TRACE_WITH("S3File::GetObjectRange", path.key, profile_start, load_end);
@@ -81,13 +111,16 @@ arrow::Status GetObjectRange(Aws::S3::S3Client *client, const S3Path &path,
 
 class ObjectInputFile : public arrow::io::RandomAccessFile {
  public:
-  ObjectInputFile(std::unique_ptr<Aws::S3::S3Client> client, const S3Path &path)
-      : client_(std::move(client)), path_(path) {}
+  ObjectInputFile(std::shared_ptr<Aws::S3::S3Client> client,
+                  const Aws::String access_token, const S3Path &path)
+      : client_(std::move(client)),
+        access_token_(std::move(access_token)),
+        path_(path) {}
 
   arrow::Status Init() {
     // Issue a HEAD Object to get the content-length and ensure any
     // errors (e.g. file not found) don't wait until the first Read() call.
-    S3Model::HeadObjectRequest req;
+    WithAuth<S3Model::HeadObjectRequest> req(access_token_);
     req.SetBucket(ToAwsString(path_.bucket));
     req.SetKey(ToAwsString(path_.key));
 
@@ -165,8 +198,8 @@ class ObjectInputFile : public arrow::io::RandomAccessFile {
 
     // Read the desired range of bytes
     S3Model::GetObjectResult result;
-    RETURN_NOT_OK(
-        GetObjectRange(client_.get(), path_, position, nbytes, &result));
+    RETURN_NOT_OK(GetObjectRange(client_.get(), access_token_, path_, position,
+                                 nbytes, &result));
 
     auto &stream = result.GetBody();
     stream.read(reinterpret_cast<char *>(out), nbytes);
@@ -206,67 +239,28 @@ class ObjectInputFile : public arrow::io::RandomAccessFile {
   }
 
  protected:
-  std::unique_ptr<Aws::S3::S3Client> client_;
+  std::shared_ptr<Aws::S3::S3Client> client_;
+  Aws::String access_token_;
   S3Path path_;
   bool closed_ = false;
   int64_t pos_ = 0;
   int64_t content_length_ = -1;
 };
 
-// Hook up token authentication
-
-static const char *kHttpClientFactoryAllocationTag =
-    "ParquetJniHttpClientFactory";
-class HttpOAuthFactory : public Aws::Http::HttpClientFactory {
- public:
-  explicit HttpOAuthFactory(const std::string &token) : token_(token) {}
-  ~HttpOAuthFactory() = default;
-  std::shared_ptr<Aws::Http::HttpClient> CreateHttpClient(
-      const Aws::Client::ClientConfiguration &clientConfiguration)
-      const override {
-    return Aws::MakeShared<Aws::Http::CurlHttpClient>(
-        kHttpClientFactoryAllocationTag, clientConfiguration);
-  }
-
-  std::shared_ptr<Aws::Http::HttpRequest> CreateHttpRequest(
-      const Aws::String &uri, Aws::Http::HttpMethod method,
-      const Aws::IOStreamFactory &streamFactory) const override {
-    return CreateHttpRequest(Aws::Http::URI(uri), method, streamFactory);
-  }
-
-  std::shared_ptr<Aws::Http::HttpRequest> CreateHttpRequest(
-      const Aws::Http::URI &uri, Aws::Http::HttpMethod method,
-      const Aws::IOStreamFactory &streamFactory) const override {
-    auto request = Aws::MakeShared<Aws::Http::Standard::StandardHttpRequest>(
-        kHttpClientFactoryAllocationTag, uri, method);
-    request->SetResponseStreamFactory(streamFactory);
-    request->SetHeaderValue("authorization", token_.c_str());
-    return request;
-  }
-
- private:
-  std::string token_;
-};
-
 arrow::Status OpenS3File(const S3Path &path, const std::string &endpoint,
                          const std::string &access_token,
                          std::shared_ptr<arrow::io::RandomAccessFile> *out) {
-  (void)access_token;
   Aws::SDKOptions options;
-  options.httpOptions.httpClientFactory_create_fn =
-      [=]() -> std::shared_ptr<Aws::Http::HttpClientFactory> {
-    return Aws::MakeShared<HttpOAuthFactory>(kHttpClientFactoryAllocationTag,
-                                             access_token);
-  };
-
   Aws::InitAPI(options);
 
   Aws::Client::ClientConfiguration clientConfig;
   clientConfig.endpointOverride = Aws::String(endpoint.begin(), endpoint.end());
-  auto s3_client = std::unique_ptr<Aws::S3::S3Client>(new Aws::S3::S3Client(
+  auto s3_client = std::make_shared<Aws::S3::S3Client>(
       Aws::Auth::AWSCredentials(), clientConfig,
-      Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, false));
-  auto file = new ObjectInputFile(std::move(s3_client), path);
+      Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, false);
+  auto file = new ObjectInputFile(
+      std::move(s3_client),
+      Aws::String(access_token.begin(), access_token.end()), path);
   ARROW_RETURN_NOT_OK(file->Init());
   *out = std::shared_ptr<ObjectInputFile>(std::move(file));
   return arrow::Status::OK();

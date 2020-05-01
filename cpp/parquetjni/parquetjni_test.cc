@@ -58,9 +58,9 @@ TEST(ParquetJniDataset, ScanDataset) {
   std::shared_ptr<ParquetJniReader> dataset;
   std::shared_ptr<arrow::RecordBatchReader> reader;
   std::shared_ptr<arrow::RecordBatch> batch;
-  std::vector<std::string> keys{"file_0.parquet", "file_1.parquet", "file_2.parquet", "file_3.parquet"};
-  ASSERT_OK(ParquetJniDataset::Open(endpoint, "", "bucket",
-                                    keys, &dataset));
+  std::vector<std::string> keys{"file_0.parquet", "file_1.parquet",
+                                "file_2.parquet", "file_3.parquet"};
+  ASSERT_OK(ParquetJniDataset::Open(endpoint, "", "bucket", keys, &dataset));
   ASSERT_OK(dataset->GetRecordBatchReader({}, "", 0, 0, false, &reader));
   do {
     const auto profile_start = std::chrono::steady_clock::now();
