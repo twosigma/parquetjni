@@ -34,6 +34,14 @@ struct S3Path {
   std::string key;
 };
 
+/// Initialize the Amazon S3 SDK. Idempotent. Do not call again after
+/// shutting down S3.
+void InitS3();
+
+/// Shut down the Amazon S3 SDK. Idempotent.
+void ShutDownS3();
+
+/// Open a file on Amazon S3.
 arrow::Status OpenS3File(const S3Path& path, const std::string& endpoint,
                          const std::string& access_token,
                          std::shared_ptr<arrow::io::RandomAccessFile>* out);

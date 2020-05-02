@@ -36,6 +36,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <thread>
 #include <utility>
 
 #include "parquetjni/memory_tracking.h"
@@ -247,12 +248,25 @@ class ObjectInputFile : public arrow::io::RandomAccessFile {
   int64_t content_length_ = -1;
 };
 
+std::once_flag kInitS3;
+std::once_flag kShutDownS3;
+Aws::SDKOptions kS3Options;
+
+void InitS3() {
+  std::call_once(kInitS3, []() { Aws::InitAPI(kS3Options); });
+}
+
+void ShutDownS3() {
+  std::call_once(kShutDownS3, []() {
+    InitS3();
+    Aws::ShutdownAPI(kS3Options);
+  });
+}
+
 arrow::Status OpenS3File(const S3Path &path, const std::string &endpoint,
                          const std::string &access_token,
                          std::shared_ptr<arrow::io::RandomAccessFile> *out) {
-  Aws::SDKOptions options;
-  Aws::InitAPI(options);
-
+  InitS3();
   Aws::Client::ClientConfiguration clientConfig;
   clientConfig.endpointOverride = Aws::String(endpoint.begin(), endpoint.end());
   auto s3_client = std::make_shared<Aws::S3::S3Client>(
